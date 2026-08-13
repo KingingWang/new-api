@@ -1,6 +1,7 @@
 package ali
 
 import (
+	"bytes"
 	"errors"
 	"fmt"
 	"io"
@@ -107,6 +108,8 @@ func (a *Adaptor) GetRequestURL(info *relaycommon.RelayInfo) (string, error) {
 			fullRequestURL = fmt.Sprintf("%s/api/v1/services/rerank/text-rerank/text-rerank", info.ChannelBaseUrl)
 		case constant.RelayModeResponses:
 			fullRequestURL = fmt.Sprintf("%s/compatible-mode/v1/responses", info.ChannelBaseUrl)
+		case constant.RelayModeAudioSpeech:
+			fullRequestURL = fmt.Sprintf("%s/api/v1/services/aigc/multimodal-generation/generation", info.ChannelBaseUrl)
 		case constant.RelayModeCompletions:
 			fullRequestURL = fmt.Sprintf("%s/compatible-mode/v1/completions", info.ChannelBaseUrl)
 		default:
@@ -181,8 +184,16 @@ func (a *Adaptor) ConvertEmbeddingRequest(c *gin.Context, info *relaycommon.Rela
 }
 
 func (a *Adaptor) ConvertAudioRequest(c *gin.Context, info *relaycommon.RelayInfo, request dto.AudioRequest) (io.Reader, error) {
-	//TODO implement me
-	return nil, errors.New("not implemented")
+	if info.RelayMode != constant.RelayModeAudioSpeech {
+		return nil, errors.New("only audio speech (TTS) is supported for ali channel")
+	}
+
+	aliReq := convertOpenAITTSRequestToAli(request)
+	jsonData, err := common.Marshal(aliReq)
+	if err != nil {
+		return nil, fmt.Errorf("error marshalling ali TTS request: %w", err)
+	}
+	return bytes.NewReader(jsonData), nil
 }
 
 func (a *Adaptor) ConvertOpenAIResponsesRequest(c *gin.Context, info *relaycommon.RelayInfo, request dto.OpenAIResponsesRequest) (any, error) {
@@ -214,6 +225,18 @@ func (a *Adaptor) DoResponse(c *gin.Context, resp *http.Response, info *relaycom
 				adaptor := openai.Adaptor{}
 				usage, err = adaptor.DoResponse(c, resp, info)
 			}
+		case constant.RelayModeAudioSpeech:
+			aliReq := (*AliTTSRequest)(nil)
+			if value, exists := c.Get(contextKeyAliTTSRequest); exists {
+				aliReq, _ = value.(*AliTTSRequest)
+			}
+
+			if aliReq != nil && isQwenAudioTTSModel(aliReq.Model) {
+				usage, err = handleAliQwenAudioTTSResponse(c, info)
+			} else if info.IsStream {
+				usage, err = handleAliTTSStreamResponse(c, resp, info)
+			} else {
+				usage, err = handleAliTTSResponse(c, resp, info)
 		default:
 			adaptor := openai.Adaptor{}
 			usage, err = adaptor.DoResponse(c, resp, info)
