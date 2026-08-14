@@ -1,6 +1,7 @@
 package openai
 
 import (
+	"bytes"
 	"fmt"
 	"io"
 	"net/http"
@@ -11,6 +12,7 @@ import (
 	"github.com/QuantumNous/new-api/logger"
 	"github.com/QuantumNous/new-api/relay/channel/openrouter"
 	relaycommon "github.com/QuantumNous/new-api/relay/common"
+	relayconstant "github.com/QuantumNous/new-api/relay/constant"
 	"github.com/QuantumNous/new-api/relay/helper"
 	"github.com/QuantumNous/new-api/relaykit/dto"
 	"github.com/QuantumNous/new-api/relaykit/types"
@@ -100,6 +102,36 @@ func sendStreamData(c *gin.Context, info *relaycommon.RelayInfo, data string, fo
 	return helper.ObjectData(c, lastStreamResponse)
 }
 
+// validateChatTextOutput checks a buffered chat completions response against
+// the configured response validation rules (empty output / output blacklist).
+// Content-filtered responses are left untouched; they are accounted for
+// separately by the caller.
+func validateChatTextOutput(c *gin.Context, response *dto.OpenAITextResponse) *types.NewAPIError {
+	if !helper.ResponseValidationActive() {
+		return nil
+	}
+	var outputText strings.Builder
+	hasOutput := false
+	for _, choice := range response.Choices {
+		if choice.FinishReason == constant.FinishReasonContentFilter {
+			return nil
+		}
+		content := choice.Message.StringContent()
+		if strings.TrimSpace(content) != "" {
+			hasOutput = true
+		}
+		outputText.WriteString(content)
+		outputText.WriteString(choice.Message.GetReasoningContent())
+		if audio := bytes.TrimSpace(choice.Message.Audio); len(audio) > 0 && !bytes.Equal(audio, []byte("null")) {
+			hasOutput = true
+		}
+		if len(choice.Message.ParseToolCalls()) > 0 {
+			hasOutput = true
+		}
+	}
+	return helper.CheckModelOutput(c, outputText.String(), hasOutput)
+}
+
 func OaiStreamHandler(c *gin.Context, info *relaycommon.RelayInfo, resp *http.Response) (*dto.Usage, *types.NewAPIError) {
 	if resp == nil || resp.Body == nil {
 		logger.LogError(c, "invalid response or response body")
@@ -115,6 +147,7 @@ func OaiStreamHandler(c *gin.Context, info *relaycommon.RelayInfo, resp *http.Re
 	var containStreamUsage bool
 	var responseTextBuilder strings.Builder
 	var toolCount int
+	var hasContent bool
 	var usage = &dto.Usage{}
 	var lastStreamData string
 	var secondLastStreamData string // 保留倒数第二个stream data；部分兼容网关把完整usage放在倒数第二个事件
@@ -135,12 +168,32 @@ func OaiStreamHandler(c *gin.Context, info *relaycommon.RelayInfo, resp *http.Re
 
 			lastStreamData = data
 			collectStreamFunctionCallNames(data, seenStreamToolCalls, &streamFunctionCallNames)
-			if err := processTokenData(info.RelayMode, data, &responseTextBuilder, &toolCount); err != nil {
+			chunkHasContent, err := processTokenData(info.RelayMode, data, &responseTextBuilder, &toolCount)
+			if err != nil {
 				logger.LogError(c, "error processing stream token data: "+err.Error())
 				sr.Error(err)
+			} else if chunkHasContent {
+				hasContent = true
 			}
 		}
 	})
+
+	// Validate model output while no response bytes have been written to the
+	// client: retry empty/thinking-only responses and
+	// outputs matching the blacklist. Once stream data has been forwarded, the
+	// response cannot be replayed on another channel.
+	// 音频模型的文本输出可能为空（实际输出为音频数据），跳过校验。
+	isAudioModel := strings.Contains(strings.ToLower(model), "audio")
+	if !isAudioModel && helper.ResponseValidationActive() &&
+		(info.RelayMode == relayconstant.RelayModeChatCompletions || info.RelayMode == relayconstant.RelayModeCompletions) {
+		if apiErr := helper.CheckModelOutput(c, responseTextBuilder.String(), hasContent || toolCount > 0); apiErr != nil {
+			if helper.StreamResponseRetryAvailable(c) {
+				helper.ResetEventStreamHeaders(c)
+				return nil, apiErr
+			}
+			logger.LogError(c, fmt.Sprintf("invalid upstream response detected, but stream data was already sent, skip retry: %s", apiErr.Error()))
+		}
+	}
 
 	// 处理最后的响应
 	shouldSendLastResp := true
@@ -276,6 +329,14 @@ func OpenaiHandler(c *gin.Context, info *relaycommon.RelayInfo, resp *http.Respo
 		if choice.FinishReason == constant.FinishReasonContentFilter {
 			common.SetContextKey(c, constant.ContextKeyAdminRejectReason, "openai_finish_reason=content_filter")
 			break
+		}
+	}
+
+	// Validate model output before anything is written to the client: retry
+	// empty/thinking-only responses and outputs matching the blacklist.
+	if info.RelayMode == relayconstant.RelayModeChatCompletions {
+		if apiErr := validateChatTextOutput(c, &simpleResponse); apiErr != nil {
+			return nil, apiErr
 		}
 	}
 
