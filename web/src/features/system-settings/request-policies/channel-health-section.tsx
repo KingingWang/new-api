@@ -86,6 +86,8 @@ const createChannelHealthSchema = (
       AutomaticEnableChannelEnabled: z.boolean(),
       AutomaticDisableKeywords: z.string(),
       AutomaticDisableStatusCodes: z.string(),
+      EmptyResponseRetryEnabled: z.boolean(),
+      ResponseBlacklistKeywords: z.string(),
       monitor_setting: z.object({
         auto_test_channel_enabled: z.boolean(),
         auto_test_channel_minutes: z.coerce
@@ -136,6 +138,8 @@ type NormalizedChannelHealthValues = {
   AutomaticEnableChannelEnabled: boolean
   AutomaticDisableKeywords: string
   AutomaticDisableStatusCodes: string
+  EmptyResponseRetryEnabled: boolean
+  ResponseBlacklistKeywords: string
   'monitor_setting.auto_test_channel_enabled': boolean
   'monitor_setting.auto_test_channel_minutes': number
   'monitor_setting.channel_test_concurrency': number
@@ -159,6 +163,10 @@ const buildFormDefaults = (
     defaults.AutomaticDisableKeywords ?? ''
   ),
   AutomaticDisableStatusCodes: defaults.AutomaticDisableStatusCodes ?? '',
+  EmptyResponseRetryEnabled: defaults.EmptyResponseRetryEnabled,
+  ResponseBlacklistKeywords: normalizeLineEndings(
+    defaults.ResponseBlacklistKeywords ?? ''
+  ),
   monitor_setting: {
     auto_test_channel_enabled:
       defaults['monitor_setting.auto_test_channel_enabled'],
@@ -184,6 +192,10 @@ const normalizeDefaults = (
   AutomaticDisableStatusCodes: parseHttpStatusCodeRules(
     defaults.AutomaticDisableStatusCodes ?? ''
   ).normalized,
+  EmptyResponseRetryEnabled: defaults.EmptyResponseRetryEnabled,
+  ResponseBlacklistKeywords: normalizeLineEndings(
+    defaults.ResponseBlacklistKeywords ?? ''
+  ),
   'monitor_setting.auto_test_channel_enabled':
     defaults['monitor_setting.auto_test_channel_enabled'],
   'monitor_setting.auto_test_channel_minutes':
@@ -207,6 +219,10 @@ const normalizeFormValues = (
   AutomaticDisableStatusCodes: parseHttpStatusCodeRules(
     values.AutomaticDisableStatusCodes
   ).normalized,
+  EmptyResponseRetryEnabled: values.EmptyResponseRetryEnabled,
+  ResponseBlacklistKeywords: normalizeLineEndings(
+    values.ResponseBlacklistKeywords
+  ),
   'monitor_setting.auto_test_channel_enabled':
     values.monitor_setting.auto_test_channel_enabled,
   'monitor_setting.auto_test_channel_minutes':
@@ -588,6 +604,60 @@ export function ChannelHealthSection({
                     <FormDescription>
                       {t(
                         'If an upstream error contains any of these keywords (case insensitive), the channel will be disabled automatically.'
+                      )}
+                    </FormDescription>
+                    <FormMessage />
+                  </FormItem>
+                )}
+              />
+            </SettingsFormGrid>
+          </div>
+
+          <Separator />
+
+          <div className='flex min-w-0 flex-col gap-4'>
+            <h4 className='text-sm font-medium'>{t('Response validation')}</h4>
+            <SettingsFormGrid>
+              <FormField
+                control={form.control}
+                name='EmptyResponseRetryEnabled'
+                render={({ field }) => (
+                  <SettingsSwitchItem>
+                    <SettingsSwitchContent>
+                      <FormLabel>{t('Retry empty responses')}</FormLabel>
+                      <FormDescription>
+                        {t(
+                          'Treat responses without content or tool calls (including reasoning-only output) as failures and retry on another channel.'
+                        )}
+                      </FormDescription>
+                    </SettingsSwitchContent>
+                    <FormControl>
+                      <Switch
+                        checked={field.value}
+                        onCheckedChange={field.onChange}
+                      />
+                    </FormControl>
+                  </SettingsSwitchItem>
+                )}
+              />
+
+              <FormField
+                control={form.control}
+                name='ResponseBlacklistKeywords'
+                render={({ field }) => (
+                  <FormItem>
+                    <FormLabel>{t('Response blacklist keywords')}</FormLabel>
+                    <FormControl>
+                      <Textarea
+                        rows={6}
+                        placeholder={t('one keyword per line')}
+                        {...field}
+                        onChange={(event) => field.onChange(event.target.value)}
+                      />
+                    </FormControl>
+                    <FormDescription>
+                      {t(
+                        'If the model output contains any of these keywords (case insensitive), the response is treated as failed and retried on another channel. Useful when a provider returns HTTP 200 with an error message as model output.'
                       )}
                     </FormDescription>
                     <FormMessage />
