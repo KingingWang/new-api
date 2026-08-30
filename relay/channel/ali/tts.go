@@ -64,20 +64,60 @@ var openAIToAliVoiceMap = map[string]string{
 	"shimmer": "Emily",
 }
 
-func mapOpenAIVoiceToAli(openAIVoice string) string {
+func mapOpenAIVoiceToAli(model, openAIVoice string) string {
+	// qwen-audio-3.0-tts 走 tts_v2 WebSocket，系统音色和 qwen3-tts
+	// 不是同一套。OpenAI 客户端通常只传 alloy/echo/...，需要映射到
+	// 当前模型真实支持的音色，避免 InvalidParameter（voice 不支持）。
+	if isQwenAudioTTSModel(model) {
+		voice := strings.ToLower(strings.TrimSpace(openAIVoice))
+		defaultVoice := "longanlingxin"
+		mapping := map[string]string{
+			"alloy":   "longanlingxin",
+			"echo":    "longanlufeng",
+			"fable":   "longanlingxin",
+			"onyx":    "longanlufeng",
+			"nova":    "longanlingxin",
+			"shimmer": "longanlingxin",
+		}
+		if strings.Contains(strings.ToLower(model), "-tts-flash") {
+			defaultVoice = "longanlingxi"
+			mapping = map[string]string{
+				"alloy":   "longanlingxi",
+				"echo":    "longanxiaoxin",
+				"fable":   "longanfengyue",
+				"onyx":    "longchuanshu_v3.6",
+				"nova":    "longanlingxi",
+				"shimmer": "longanyuanfei",
+			}
+		}
+		if mapped, ok := mapping[voice]; ok {
+			return mapped
+		}
+		if voice == "" {
+			return defaultVoice
+		}
+		// 保留用户直接传入的音色 ID（例如声音复刻音色）。
+		return openAIVoice
+	}
+
 	if voice, ok := openAIToAliVoiceMap[openAIVoice]; ok {
 		return voice
 	}
 	return openAIVoice
 }
 
-func convertOpenAITTSRequestToAli(oaiReq dto.AudioRequest) *AliTTSRequest {
+func convertOpenAITTSRequestToAli(oaiReq dto.AudioRequest, model string) *AliTTSRequest {
+	languageType := "Chinese"
+	if isQwenAudioTTSModel(model) {
+		languageType = ""
+	}
+
 	aliReq := &AliTTSRequest{
-		Model: oaiReq.Model,
+		Model: model,
 		Input: AliTTSInput{
 			Text:         oaiReq.Input,
-			Voice:        mapOpenAIVoiceToAli(oaiReq.Voice),
-			LanguageType: "Chinese",
+			Voice:        mapOpenAIVoiceToAli(model, oaiReq.Voice),
+			LanguageType: languageType,
 		},
 	}
 
