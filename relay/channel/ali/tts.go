@@ -2,10 +2,12 @@ package ali
 
 import (
 	"encoding/base64"
+	"encoding/binary"
 	"fmt"
 	"io"
 	"net/http"
 	"net/url"
+	"strings"
 	"time"
 
 	"github.com/QuantumNous/new-api/common"
@@ -191,23 +193,124 @@ func fetchAliAudioURL(c *gin.Context, rawURL string) ([]byte, string, error) {
 	return data, contentType, nil
 }
 
-// handleAliTTSStreamResponse 处理 DashScope SSE 流式响应，并把每一帧 data 透传给客户端。
-// DashScope 流式返回的 data 为 JSON，其中 output.audio.data 是 Base64 编码的 16bit PCM，
-// 最后一个数据包含 output.finish_reason="stop"。
+// handleAliTTSStreamResponse 将 DashScope 的 SSE 流式响应转码为 WAV 字节流返回给客户端。
+//
+// DashScope 侧通过 X-DashScope-SSE 开启流式，返回的每一帧 data 是 JSON：
+//
+//	{"output":{"audio":{"data":"<base64 16bit PCM>"}}}
+//
+// 而多数 OpenAI 兼容客户端（例如小智的 openai provider）读取的是原始音频字节流，
+// 因此这里把 SSE 帧解码成 PCM，并在首帧补一个 WAV 头，按字节流下发给客户端。
 func handleAliTTSStreamResponse(c *gin.Context, resp *http.Response, info *relaycommon.RelayInfo) (usage any, err *types.NewAPIError) {
 	u := &dto.Usage{
 		PromptTokens: info.GetEstimatePromptTokens(),
 	}
+	defer resp.Body.Close()
 
-	helper.StreamScannerHandler(c, resp, info, func(data string, sr *helper.StreamResult) {
+	c.Writer.Header().Set("Content-Type", "audio/wav")
+	c.Writer.WriteHeader(http.StatusOK)
+
+	scanner := helper.NewStreamScanner(resp.Body)
+	wroteHeader := false
+
+	for scanner.Scan() {
+		line := scanner.Text()
+		if len(line) < 6 || line[:5] != "data:" {
+			continue
+		}
+
+		payload := strings.TrimSpace(line[5:])
+		if payload == "" {
+			continue
+		}
+		if payload == "[DONE]" {
+			break
+		}
+
 		var ev AliTTSResponse
-		if unmarshalErr := common.Unmarshal([]byte(data), &ev); unmarshalErr == nil && ev.Usage.Characters > 0 {
+		if unmarshalErr := common.Unmarshal([]byte(payload), &ev); unmarshalErr == nil && ev.Usage.Characters > 0 {
 			u.TotalTokens = ev.Usage.Characters
 		}
-		if writeErr := helper.StringData(c, data); writeErr != nil {
-			sr.Error(writeErr)
+		if ev.Output.Audio.Data == "" {
+			continue
 		}
-	})
+
+		pcm, decodeErr := base64.StdEncoding.DecodeString(strings.TrimSpace(ev.Output.Audio.Data))
+		if decodeErr != nil {
+			return u, types.NewErrorWithStatusCode(
+				fmt.Errorf("failed to decode ali TTS audio data: %w", decodeErr),
+				types.ErrorCodeBadResponseBody,
+				http.StatusInternalServerError,
+			)
+		}
+		if len(pcm) == 0 {
+			continue
+		}
+
+		if !wroteHeader {
+			// DashScope 有时首帧自带完整 WAV 头，有时只有裸 PCM。
+			// 已经带 WAV 头就直接透传，否则我们自己补一个。
+			if !isRIFFWave(pcm) {
+				sampleRate := 24000
+				if strings.Contains(strings.ToLower(info.UpstreamModelName), "qwen-audio") {
+					sampleRate = 48000
+				}
+				if _, hdrErr := c.Writer.Write(buildWAVHeader(sampleRate, 1, 16)); hdrErr != nil {
+					return u, types.NewErrorWithStatusCode(
+						fmt.Errorf("failed to write WAV header: %w", hdrErr),
+						types.ErrorCodeDoRequestFailed,
+						http.StatusInternalServerError,
+					)
+				}
+			}
+			wroteHeader = true
+		}
+
+		if _, writeErr := c.Writer.Write(pcm); writeErr != nil {
+			return u, types.NewErrorWithStatusCode(
+				fmt.Errorf("failed to write audio data: %w", writeErr),
+				types.ErrorCodeDoRequestFailed,
+				http.StatusInternalServerError,
+			)
+		}
+		c.Writer.Flush()
+	}
+
+	if scanErr := scanner.Err(); scanErr != nil {
+		return u, types.NewErrorWithStatusCode(
+			fmt.Errorf("failed to read ali TTS stream: %w", scanErr),
+			types.ErrorCodeReadResponseBodyFailed,
+			http.StatusInternalServerError,
+		)
+	}
 
 	return u, nil
+}
+
+// isRIFFWave 判断一段字节是否是带 RIFF/WAVE 头的 WAV 数据至少 12 字节的前缀。
+func isRIFFWave(b []byte) bool {
+	return len(b) >= 12 && string(b[:4]) == "RIFF" && string(b[8:12]) == "WAVE"
+}
+
+// buildWAVHeader 构造一个 44 字节的标准 PCM WAV 头。流式场景下 RIFF/data
+// 长度无法预先知道，填 0 即可；客户端只关心采样率与声道数。
+func buildWAVHeader(sampleRate, channels, bitsPerSample int) []byte {
+	byteRate := sampleRate * channels * bitsPerSample / 8
+	blockAlign := channels * bitsPerSample / 8
+
+	h := make([]byte, 44)
+	copy(h[0:4], "RIFF")
+	binary.LittleEndian.PutUint32(h[4:8], 0)
+	copy(h[8:12], "WAVE")
+	copy(h[12:16], "fmt ")
+	binary.LittleEndian.PutUint32(h[16:20], 16)
+	binary.LittleEndian.PutUint16(h[20:22], 1) // PCM
+	binary.LittleEndian.PutUint16(h[22:24], uint16(channels))
+	binary.LittleEndian.PutUint32(h[24:28], uint32(sampleRate))
+	binary.LittleEndian.PutUint32(h[28:32], uint32(byteRate))
+	binary.LittleEndian.PutUint16(h[32:34], uint16(blockAlign))
+	binary.LittleEndian.PutUint16(h[34:36], uint16(bitsPerSample))
+	copy(h[36:40], "data")
+	binary.LittleEndian.PutUint32(h[40:44], 0)
+	return h
 }
