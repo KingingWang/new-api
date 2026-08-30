@@ -272,7 +272,11 @@ func (a *Adaptor) DoResponse(c *gin.Context, resp *http.Response, info *relaycom
 		case constant.RelayModeRerank:
 			err, usage = RerankHandler(c, resp, info)
 		case constant.RelayModeAudioSpeech:
-			usage, err = handleAliTTSResponse(c, resp, info)
+			if info.IsStream {
+				usage, err = handleAliTTSStreamResponse(c, resp, info)
+			} else {
+				usage, err = handleAliTTSResponse(c, resp, info)
+			}
 		default:
 			adaptor := openai.Adaptor{}
 			usage, err = adaptor.DoResponse(c, resp, info)
