@@ -153,20 +153,28 @@ func TestHandleAliTTSResponseBase64Audio(t *testing.T) {
 	assert.Equal(t, 0, usage.CompletionTokens)
 }
 
-func TestHandleAliTTSResponseAudioURLRedirect(t *testing.T) {
+func TestHandleAliTTSResponseAudioURL(t *testing.T) {
+	audioBytes := []byte("fake-wav-bytes")
+	audioServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "audio/wav")
+		_, _ = w.Write(audioBytes)
+	}))
+	defer audioServer.Close()
+
 	gin.SetMode(gin.TestMode)
 	recorder := httptest.NewRecorder()
 	c, _ := gin.CreateTestContext(recorder)
-	c.Request = httptest.NewRequest(http.MethodGet, "/v1/audio/speech", nil)
+	c.Request = httptest.NewRequest(http.MethodPost, "/v1/audio/speech", nil)
 
-	respBody := `{"output":{"audio":{"url":"https://example.com/audio.wav","expires_at":1893456000}},"usage":{"characters":10},"request_id":"req-2"}`
+	respBody := `{"output":{"audio":{"url":"` + audioServer.URL + `/audio.wav","expires_at":1893456000}},"usage":{"characters":10},"request_id":"req-2"}`
 
 	info := &relaycommon.RelayInfo{RelayMode: relayconstant.RelayModeAudioSpeech}
 	usageAny, apiErr := handleAliTTSResponse(c, newAliTTSMockResponse(respBody), info)
 	require.Nil(t, apiErr)
 
-	assert.Equal(t, http.StatusFound, recorder.Code)
-	assert.Equal(t, "https://example.com/audio.wav", recorder.Header().Get("Location"))
+	assert.Equal(t, http.StatusOK, recorder.Code)
+	assert.Equal(t, "audio/wav", recorder.Header().Get("Content-Type"))
+	assert.Equal(t, audioBytes, recorder.Body.Bytes())
 
 	usage, ok := usageAny.(*dto.Usage)
 	require.True(t, ok)
