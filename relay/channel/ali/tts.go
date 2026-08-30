@@ -5,6 +5,8 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"net/url"
+	"time"
 
 	"github.com/QuantumNous/new-api/common"
 	relaycommon "github.com/QuantumNous/new-api/relay/common"
@@ -111,9 +113,18 @@ func handleAliTTSResponse(c *gin.Context, resp *http.Response, info *relaycommon
 		)
 	}
 
-	// 优先使用 URL，如果没有则使用 base64 data
+	// 优先使用 URL：服务端下载后直接回吐音频字节，而不是 302 重定向，
+	// 因为多数 OpenAI 兼容客户端默认不跟随重定向。
 	if aliResp.Output.Audio.URL != "" {
-		c.Redirect(http.StatusFound, aliResp.Output.Audio.URL)
+		audioData, contentType, fetchErr := fetchAliAudioURL(c, aliResp.Output.Audio.URL)
+		if fetchErr != nil {
+			return nil, types.NewErrorWithStatusCode(
+				fetchErr,
+				types.ErrorCodeDoRequestFailed,
+				http.StatusInternalServerError,
+			)
+		}
+		c.Data(http.StatusOK, contentType, audioData)
 	} else if aliResp.Output.Audio.Data != "" {
 		// 如果是 base64 编码的音频数据
 		audioData, decodeErr := base64.StdEncoding.DecodeString(aliResp.Output.Audio.Data)
@@ -140,4 +151,41 @@ func handleAliTTSResponse(c *gin.Context, resp *http.Response, info *relaycommon
 	}
 
 	return usage, nil
+}
+
+func fetchAliAudioURL(c *gin.Context, rawURL string) ([]byte, string, error) {
+	parsed, err := url.Parse(rawURL)
+	if err != nil {
+		return nil, "", fmt.Errorf("invalid audio url: %w", err)
+	}
+	if parsed.Scheme != "http" && parsed.Scheme != "https" {
+		return nil, "", fmt.Errorf("unsupported audio url scheme: %s", parsed.Scheme)
+	}
+
+	req, err := http.NewRequestWithContext(c.Request.Context(), http.MethodGet, rawURL, nil)
+	if err != nil {
+		return nil, "", fmt.Errorf("failed to build audio download request: %w", err)
+	}
+
+	client := &http.Client{Timeout: 30 * time.Second}
+	resp, err := client.Do(req)
+	if err != nil {
+		return nil, "", fmt.Errorf("failed to download audio: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		return nil, "", fmt.Errorf("audio url returned status %d", resp.StatusCode)
+	}
+
+	data, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return nil, "", fmt.Errorf("failed to read audio data: %w", err)
+	}
+
+	contentType := resp.Header.Get("Content-Type")
+	if contentType == "" {
+		contentType = "audio/wav"
+	}
+	return data, contentType, nil
 }
