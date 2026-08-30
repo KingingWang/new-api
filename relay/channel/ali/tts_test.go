@@ -1,14 +1,15 @@
 package ali
 
 import (
+	"bytes"
 	"encoding/base64"
+	"encoding/binary"
 	"io"
 	"net/http"
 	"net/http/httptest"
 	"strings"
 	"testing"
 
-	"github.com/QuantumNous/new-api/constant"
 	relaycommon "github.com/QuantumNous/new-api/relay/common"
 	relayconstant "github.com/QuantumNous/new-api/relay/constant"
 	"github.com/QuantumNous/new-api/relaykit/dto"
@@ -217,20 +218,23 @@ func TestAudioRequestIsStream(t *testing.T) {
 }
 
 func TestHandleAliTTSStreamResponse(t *testing.T) {
-	oldTimeout := constant.StreamingTimeout
-	constant.StreamingTimeout = 30
-	t.Cleanup(func() { constant.StreamingTimeout = oldTimeout })
-
 	gin.SetMode(gin.TestMode)
 	recorder := httptest.NewRecorder()
 	c, _ := gin.CreateTestContext(recorder)
 	c.Request = httptest.NewRequest(http.MethodPost, "/v1/audio/speech", nil)
 
-	body := "data: {\"output\":{\"audio\":{\"data\":\"AAAA\"},\"finish_reason\":null}}\n" +
-		"data: {\"output\":{\"audio\":{\"data\":\"BBBB\"},\"finish_reason\":\"stop\"},\"usage\":{\"characters\":7}}\n"
+	// "AAAA" / "BBBB" 分别解码为 3 个字节的 PCM
+	body := "data: {\"output\":{\"audio\":{\"data\":\"AAAA\"}}}\n" +
+		"data: {\"output\":{\"audio\":{\"data\":\"BBBB\"}}}\n" +
+		"data: {\"output\":{\"finish_reason\":\"stop\"},\"usage\":{\"characters\":7}}\n"
 
 	resp := &http.Response{Body: io.NopCloser(strings.NewReader(body))}
-	info := &relaycommon.RelayInfo{RelayMode: relayconstant.RelayModeAudioSpeech}
+	info := &relaycommon.RelayInfo{
+		RelayMode: relayconstant.RelayModeAudioSpeech,
+		ChannelMeta: &relaycommon.ChannelMeta{
+			UpstreamModelName: "qwen3-tts-flash",
+		},
+	}
 
 	usageAny, apiErr := handleAliTTSStreamResponse(c, resp, info)
 	require.Nil(t, apiErr)
@@ -239,7 +243,15 @@ func TestHandleAliTTSStreamResponse(t *testing.T) {
 	require.True(t, ok)
 	assert.Equal(t, 7, usage.TotalTokens)
 
-	output := recorder.Body.String()
-	assert.Contains(t, output, `"audio":{"data":"AAAA"`)
-	assert.Contains(t, output, `"finish_reason":"stop"`)
+	assert.Equal(t, http.StatusOK, recorder.Code)
+	assert.Equal(t, "audio/wav", recorder.Header().Get("Content-Type"))
+
+	out := recorder.Body.Bytes()
+	require.True(t, bytes.HasPrefix(out, []byte("RIFF")))
+	assert.Equal(t, []byte("WAVE"), out[8:12])
+	// 44 字节 WAV 头 + 两段各 3 字节 PCM
+	assert.Equal(t, 44+3+3, len(out))
+	// 采样率 24000，单声道
+	assert.Equal(t, uint32(24000), binary.LittleEndian.Uint32(out[24:28]))
+	assert.Equal(t, uint16(1), binary.LittleEndian.Uint16(out[22:24]))
 }
