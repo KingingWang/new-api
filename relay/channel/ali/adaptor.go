@@ -188,7 +188,8 @@ func (a *Adaptor) ConvertAudioRequest(c *gin.Context, info *relaycommon.RelayInf
 		return nil, errors.New("only audio speech (TTS) is supported for ali channel")
 	}
 
-	aliReq := convertOpenAITTSRequestToAli(request)
+	aliReq := convertOpenAITTSRequestToAli(request, request.Model)
+	c.Set(contextKeyAliTTSRequest, aliReq)
 	jsonData, err := common.Marshal(aliReq)
 	if err != nil {
 		return nil, fmt.Errorf("error marshalling ali TTS request: %w", err)
@@ -201,6 +202,13 @@ func (a *Adaptor) ConvertOpenAIResponsesRequest(c *gin.Context, info *relaycommo
 }
 
 func (a *Adaptor) DoRequest(c *gin.Context, info *relaycommon.RelayInfo, requestBody io.Reader) (any, error) {
+	if info.RelayMode == constant.RelayModeAudioSpeech {
+		if value, exists := c.Get(contextKeyAliTTSRequest); exists {
+			if aliReq, ok := value.(*AliTTSRequest); ok && isQwenAudioTTSModel(aliReq.Model) {
+				return nil, nil
+			}
+		}
+	}
 	return channel.DoApiRequest(a, c, info, requestBody)
 }
 
