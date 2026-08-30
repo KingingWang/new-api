@@ -41,6 +41,30 @@ func SetRelayRouter(router *gin.Engine) {
 		})
 	}
 
+	audioVoicesRouter := router.Group("/v1/audio")
+	audioVoicesRouter.Use(middleware.RouteTag("relay"))
+	audioVoicesRouter.Use(middleware.TokenAuth())
+	{
+		audioVoicesRouter.GET("/voices", func(c *gin.Context) {
+			voices := map[string]string{
+				"Cherry":   "芊悦",
+				"Serena":   "苏瑶",
+				"Ethan":    "晨煦",
+				"Chelsie":  "千雪",
+				"Momo":     "茉兔",
+				"Vivian":   "十三",
+				"Moon":     "月白",
+				"Maia":     "四月",
+				"Kai":      "凯",
+				"Nofish":   "不吃鱼",
+				"Bella":    "萌宝",
+				"Jennifer": "詹妮弗",
+				"Ryan":     "甜茶",
+			}
+			c.JSON(200, voices)
+		})
+	}
+
 	geminiRouter := router.Group("/v1beta/models")
 	geminiRouter.Use(middleware.RouteTag("relay"))
 	geminiRouter.Use(middleware.TokenAuth())
