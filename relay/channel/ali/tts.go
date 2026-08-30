@@ -10,6 +10,7 @@ import (
 
 	"github.com/QuantumNous/new-api/common"
 	relaycommon "github.com/QuantumNous/new-api/relay/common"
+	"github.com/QuantumNous/new-api/relay/helper"
 	"github.com/QuantumNous/new-api/relaykit/dto"
 	"github.com/QuantumNous/new-api/relaykit/types"
 	"github.com/gin-gonic/gin"
@@ -188,4 +189,25 @@ func fetchAliAudioURL(c *gin.Context, rawURL string) ([]byte, string, error) {
 		contentType = "audio/wav"
 	}
 	return data, contentType, nil
+}
+
+// handleAliTTSStreamResponse 处理 DashScope SSE 流式响应，并把每一帧 data 透传给客户端。
+// DashScope 流式返回的 data 为 JSON，其中 output.audio.data 是 Base64 编码的 16bit PCM，
+// 最后一个数据包含 output.finish_reason="stop"。
+func handleAliTTSStreamResponse(c *gin.Context, resp *http.Response, info *relaycommon.RelayInfo) (usage any, err *types.NewAPIError) {
+	u := &dto.Usage{
+		PromptTokens: info.GetEstimatePromptTokens(),
+	}
+
+	helper.StreamScannerHandler(c, resp, info, func(data string, sr *helper.StreamResult) {
+		var ev AliTTSResponse
+		if unmarshalErr := common.Unmarshal([]byte(data), &ev); unmarshalErr == nil && ev.Usage.Characters > 0 {
+			u.TotalTokens = ev.Usage.Characters
+		}
+		if writeErr := helper.StringData(c, data); writeErr != nil {
+			sr.Error(writeErr)
+		}
+	})
+
+	return u, nil
 }
