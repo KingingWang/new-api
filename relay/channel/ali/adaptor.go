@@ -237,6 +237,7 @@ func (a *Adaptor) DoResponse(c *gin.Context, resp *http.Response, info *relaycom
 				usage, err = handleAliTTSStreamResponse(c, resp, info)
 			} else {
 				usage, err = handleAliTTSResponse(c, resp, info)
+			}
 		default:
 			adaptor := openai.Adaptor{}
 			usage, err = adaptor.DoResponse(c, resp, info)
