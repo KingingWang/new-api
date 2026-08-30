@@ -69,7 +69,7 @@ func TestConvertOpenAITTSRequestToAli(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			got := convertOpenAITTSRequestToAli(tt.request)
+			got := convertOpenAITTSRequestToAli(tt.request, tt.request.Model)
 			assert.Equal(t, tt.request.Model, got.Model)
 			assert.Equal(t, tt.wantText, got.Input.Text)
 			assert.Equal(t, tt.wantVoice, got.Input.Voice)
@@ -77,6 +77,13 @@ func TestConvertOpenAITTSRequestToAli(t *testing.T) {
 			assert.Equal(t, "Chinese", got.Input.LanguageType)
 		})
 	}
+}
+
+func TestMapQwenAudioTTSVoice(t *testing.T) {
+	require.Equal(t, "longanlingxin", mapOpenAIVoiceToAli("qwen-audio-3.0-tts-plus", "alloy"))
+	require.Equal(t, "longanlufeng", mapOpenAIVoiceToAli("qwen-audio-3.0-tts-plus", "echo"))
+	require.Equal(t, "longanlingxin", mapOpenAIVoiceToAli("qwen-audio-3.0-tts-plus", ""))
+	require.Equal(t, "Cherry", mapOpenAIVoiceToAli("qwen3-tts-flash", "alloy"))
 }
 
 func TestAliTTSGetRequestURL(t *testing.T) {
