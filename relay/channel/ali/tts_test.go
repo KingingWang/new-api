@@ -8,6 +8,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/QuantumNous/new-api/constant"
 	relaycommon "github.com/QuantumNous/new-api/relay/common"
 	relayconstant "github.com/QuantumNous/new-api/relay/constant"
 	"github.com/QuantumNous/new-api/relaykit/dto"
@@ -206,4 +207,39 @@ func TestHandleAliTTSResponseNoAudio(t *testing.T) {
 	usageAny, apiErr := handleAliTTSResponse(c, newAliTTSMockResponse(respBody), info)
 	require.NotNil(t, apiErr)
 	assert.Nil(t, usageAny)
+}
+
+func TestAudioRequestIsStream(t *testing.T) {
+	assert.True(t, (&dto.AudioRequest{Stream: true}).IsStream(nil))
+	assert.True(t, (&dto.AudioRequest{StreamFormat: "sse"}).IsStream(nil))
+	assert.True(t, (&dto.AudioRequest{StreamFormat: "stream"}).IsStream(nil))
+	assert.False(t, (&dto.AudioRequest{}).IsStream(nil))
+}
+
+func TestHandleAliTTSStreamResponse(t *testing.T) {
+	oldTimeout := constant.StreamingTimeout
+	constant.StreamingTimeout = 30
+	t.Cleanup(func() { constant.StreamingTimeout = oldTimeout })
+
+	gin.SetMode(gin.TestMode)
+	recorder := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(recorder)
+	c.Request = httptest.NewRequest(http.MethodPost, "/v1/audio/speech", nil)
+
+	body := "data: {\"output\":{\"audio\":{\"data\":\"AAAA\"},\"finish_reason\":null}}\n" +
+		"data: {\"output\":{\"audio\":{\"data\":\"BBBB\"},\"finish_reason\":\"stop\"},\"usage\":{\"characters\":7}}\n"
+
+	resp := &http.Response{Body: io.NopCloser(strings.NewReader(body))}
+	info := &relaycommon.RelayInfo{RelayMode: relayconstant.RelayModeAudioSpeech}
+
+	usageAny, apiErr := handleAliTTSStreamResponse(c, resp, info)
+	require.Nil(t, apiErr)
+
+	usage, ok := usageAny.(*dto.Usage)
+	require.True(t, ok)
+	assert.Equal(t, 7, usage.TotalTokens)
+
+	output := recorder.Body.String()
+	assert.Contains(t, output, `"audio":{"data":"AAAA"`)
+	assert.Contains(t, output, `"finish_reason":"stop"`)
 }
