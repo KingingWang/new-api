@@ -5,6 +5,7 @@ import (
 	"log"
 	"net/url"
 	"os"
+	"regexp"
 	"strings"
 	"sync"
 	"time"
@@ -13,6 +14,8 @@ import (
 	"github.com/QuantumNous/new-api/constant"
 
 	"github.com/glebarez/sqlite"
+	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/stdlib"
 	"gorm.io/driver/clickhouse"
 	"gorm.io/driver/mysql"
 	"gorm.io/driver/postgres"
@@ -137,6 +140,43 @@ func normalizeClickHouseDSN(dsn string) string {
 	return parsed.String()
 }
 
+// postgresTimeZoneMatcher 与 gorm.io/driver/postgres 内部的 DSN 时区提取保持一致;
+// 连接池改为手动构建后,驱动自身的 DSN 解析不再执行,需要在这里补上。
+var postgresTimeZoneMatcher = regexp.MustCompile("(time_zone|TimeZone)=(.*?)($|&| )")
+
+// PostgresPoolerDialector 构建生产使用的 PostgreSQL 连接:彻底关闭预处理语句。
+// 命名 prepared statement 属于会话状态,与事务池代理(PgBouncer/Neon/Supabase)
+// 不兼容,会触发 FATAL 08P01/42P05;简单协议由连接池默认执行模式全局启用。
+//
+// 连接池手动构建并经 Conn 传入,同时指定非 "pgx" 的 DriverName:当 PrepareStmt
+// 关闭时,driver/postgres 的 migrator GetRows 会把
+// pgx.QueryExecModeSimpleProtocol 预置进查询参数,导致占位符编号与实参错位,
+// 所有 ColumnTypes 调用(启动时的钱包 schema 校验、已有表的 AutoMigrate)都会
+// 以 "insufficient arguments" 失败(go-gorm/gorm#7675)。简单协议本就是连接池
+// 级默认,跳过该注入不改变任何行为。
+func PostgresPoolerDialector(dsn string) (gorm.Dialector, error) {
+	connConfig, err := pgx.ParseConfig(dsn)
+	if err != nil {
+		return nil, fmt.Errorf("failed to parse PostgreSQL DSN: %w", err)
+	}
+	connConfig.DefaultQueryExecMode = pgx.QueryExecModeSimpleProtocol
+	if result := postgresTimeZoneMatcher.FindStringSubmatch(dsn); len(result) > 2 {
+		connConfig.RuntimeParams["timezone"] = result[2]
+	}
+	return postgres.New(postgres.Config{
+		Conn:       stdlib.OpenDB(*connConfig),
+		DriverName: "postgres",
+	}), nil
+}
+
+func openPostgres(dsn string) (*gorm.DB, error) {
+	dialector, err := PostgresPoolerDialector(dsn)
+	if err != nil {
+		return nil, err
+	}
+	return gorm.Open(dialector, newGormConfig(false))
+}
+
 func chooseDB(envName string, isLog bool) (*gorm.DB, common.DatabaseType, error) {
 	dsn := os.Getenv(envName)
 	if dsn != "" {
@@ -151,12 +191,7 @@ func chooseDB(envName string, isLog bool) (*gorm.DB, common.DatabaseType, error)
 		if strings.HasPrefix(dsn, "postgres://") || strings.HasPrefix(dsn, "postgresql://") {
 			// Use PostgreSQL
 			common.SysLog("using PostgreSQL as database")
-			// 同时关闭 pgx 隐式与 GORM 显式预处理语句:命名 prepared statement 与
-			// 事务池代理(PgBouncer/Neon/Supabase)不兼容,会触发 FATAL 08P01/42P05。
-			db, err := gorm.Open(postgres.New(postgres.Config{
-				DSN:                  dsn,
-				PreferSimpleProtocol: true,
-			}), newGormConfig(false))
+			db, err := openPostgres(dsn)
 			return db, common.DatabaseTypePostgreSQL, err
 		}
 		if strings.HasPrefix(dsn, "local") {
