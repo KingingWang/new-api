@@ -17,7 +17,6 @@ import (
 	"github.com/gin-gonic/gin"
 	"github.com/glebarez/sqlite"
 	"gorm.io/driver/mysql"
-	"gorm.io/driver/postgres"
 	"gorm.io/gorm"
 )
 
@@ -129,7 +128,13 @@ func openTokenControllerExternalDB(t *testing.T, dialect string, dsn string) (*g
 		db, err = gorm.Open(mysql.Open(dsn), &gorm.Config{})
 	case "postgres":
 		dbType = common.DatabaseTypePostgreSQL
-		db, err = gorm.Open(postgres.Open(dsn), &gorm.Config{})
+		// 与生产一致的池兼容连接;裸 postgres.Open 在 PrepareStmt 关闭时会触发
+		// 驱动 GetRows 注入 bug,ColumnTypes 报 "insufficient arguments"。
+		var dialector gorm.Dialector
+		dialector, err = model.PostgresPoolerDialector(dsn)
+		if err == nil {
+			db, err = gorm.Open(dialector, &gorm.Config{})
+		}
 	default:
 		t.Fatalf("unsupported dialect %q", dialect)
 	}

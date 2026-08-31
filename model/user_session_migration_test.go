@@ -13,7 +13,6 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"gorm.io/driver/mysql"
-	"gorm.io/driver/postgres"
 	"gorm.io/gorm"
 	"gorm.io/gorm/logger"
 )
@@ -129,12 +128,12 @@ func TestUserSessionPreviousRefreshHashMigrationConfiguredDatabases(t *testing.T
 	tests := []struct {
 		name      string
 		env       string
-		dialector func(string) gorm.Dialector
+		dialector func(string) (gorm.Dialector, error)
 	}{
-		{name: "mysql", env: "TEST_MYSQL_DSN", dialector: func(dsn string) gorm.Dialector { return mysql.Open(dsn) }},
-		{name: "postgres", env: "TEST_POSTGRES_DSN", dialector: func(dsn string) gorm.Dialector {
-			return postgres.New(postgres.Config{DSN: dsn, PreferSimpleProtocol: true})
-		}},
+		{name: "mysql", env: "TEST_MYSQL_DSN", dialector: func(dsn string) (gorm.Dialector, error) { return mysql.Open(dsn), nil }},
+		// 与生产一致的池兼容连接;旧的 DSN+PreferSimpleProtocol 直连在
+		// PrepareStmt 关闭时会触发驱动 GetRows 注入 bug(go-gorm/gorm#7675)。
+		{name: "postgres", env: "TEST_POSTGRES_DSN", dialector: PostgresPoolerDialector},
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
@@ -143,7 +142,9 @@ func TestUserSessionPreviousRefreshHashMigrationConfiguredDatabases(t *testing.T
 				t.Skip(test.env + " is not configured")
 			}
 			recorder := &migrationSQLRecorder{}
-			db, err := gorm.Open(test.dialector(dsn), &gorm.Config{Logger: recorder})
+			dialector, err := test.dialector(dsn)
+			require.NoError(t, err)
+			db, err := gorm.Open(dialector, &gorm.Config{Logger: recorder})
 			require.NoError(t, err)
 			sqlDB, err := db.DB()
 			require.NoError(t, err)
