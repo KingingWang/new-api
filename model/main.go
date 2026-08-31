@@ -174,7 +174,7 @@ func openPostgres(dsn string) (*gorm.DB, error) {
 	if err != nil {
 		return nil, err
 	}
-	return gorm.Open(dialector, newGormConfig(false))
+	return gorm.Open(guardUniqueMigration(dialector), newGormConfig(false))
 }
 
 func chooseDB(envName string, isLog bool) (*gorm.DB, common.DatabaseType, error) {
@@ -196,7 +196,7 @@ func chooseDB(envName string, isLog bool) (*gorm.DB, common.DatabaseType, error)
 		}
 		if strings.HasPrefix(dsn, "local") {
 			common.SysLog("SQL_DSN not set, using SQLite as database")
-			db, err := gorm.Open(sqlite.Open(common.SQLitePath), newGormConfig(true))
+			db, err := gorm.Open(guardUniqueMigration(sqlite.Open(common.SQLitePath)), newGormConfig(true))
 			return db, common.DatabaseTypeSQLite, err
 		}
 		// Use MySQL
@@ -214,7 +214,7 @@ func chooseDB(envName string, isLog bool) (*gorm.DB, common.DatabaseType, error)
 	}
 	// Use SQLite
 	common.SysLog("SQL_DSN not set, using SQLite as database")
-	db, err := gorm.Open(sqlite.Open(common.SQLitePath), newGormConfig(true))
+	db, err := gorm.Open(guardUniqueMigration(sqlite.Open(common.SQLitePath)), newGormConfig(true))
 	return db, common.DatabaseTypeSQLite, err
 }
 
@@ -349,6 +349,47 @@ func is64BitIntegerType(dbType common.DatabaseType, dataType string) bool {
 	}
 }
 
+// migratePrefillGroupNameUnique 删除旧版本遗留在 prefill_groups.name 上的绝对
+// 唯一索引(名为 idx_prefill_groups_name),仅覆盖 MySQL 与 SQLite;PostgreSQL
+// 由 migratePrefillGroupUniqueness(prefill_group_migration.go)在加锁事务内
+// 校验并迁移。当前 schema 已改为部分唯一索引 uk_prefill_name
+// (WHERE deleted_at IS NULL),遗留的绝对唯一索引会让软删除行的重名依旧冲突。
+// MySQL 只删除恰好覆盖 name 单列的唯一索引,保留现有 schema 定义的索引。
+func migratePrefillGroupNameUnique() error {
+	const (
+		tableName       = "prefill_groups"
+		currentIndex    = "uk_prefill_name"
+		legacyIndexName = "idx_prefill_groups_name"
+	)
+	if !DB.Migrator().HasTable(tableName) {
+		return nil
+	}
+
+	switch {
+	case common.UsingMainDatabase(common.DatabaseTypeMySQL):
+		var indexNames []string
+		err := DB.Raw(`SELECT INDEX_NAME FROM information_schema.STATISTICS
+			WHERE table_schema = DATABASE() AND table_name = ? AND NON_UNIQUE = 0
+				AND INDEX_NAME NOT IN ('PRIMARY', ?)
+			GROUP BY INDEX_NAME
+			HAVING COUNT(*) = 1 AND MAX(COLUMN_NAME) = 'name'`,
+			tableName, currentIndex).Scan(&indexNames).Error
+		if err != nil {
+			return fmt.Errorf("failed to query %s unique indexes: %w", tableName, err)
+		}
+		for _, indexName := range indexNames {
+			if err := DB.Exec(fmt.Sprintf("ALTER TABLE %s DROP INDEX `%s`", tableName, indexName)).Error; err != nil {
+				return fmt.Errorf("failed to drop legacy unique index %q on %s: %w", indexName, tableName, err)
+			}
+		}
+	case common.UsingMainDatabase(common.DatabaseTypeSQLite):
+		if err := DB.Exec(fmt.Sprintf(`DROP INDEX IF EXISTS %s`, legacyIndexName)).Error; err != nil {
+			return fmt.Errorf("failed to drop legacy unique index %q: %w", legacyIndexName, err)
+		}
+	}
+	return nil
+}
+
 func migrateDB() error {
 	if err := migrateTokenKeyUniqueness(DB); err != nil {
 		return err
@@ -360,6 +401,10 @@ func migrateDB() error {
 	migrateSubscriptionPlanPriceAmount()
 	// Migrate model_limits column from varchar to text for existing tables
 	if err := migrateTokenModelLimitsToText(); err != nil {
+		return err
+	}
+	// Drop the legacy absolute unique constraint/index on prefill_groups.name
+	if err := migratePrefillGroupNameUnique(); err != nil {
 		return err
 	}
 
