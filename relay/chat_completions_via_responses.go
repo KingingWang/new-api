@@ -2,6 +2,7 @@ package relay
 
 import (
 	"bufio"
+	"bytes"
 	"fmt"
 	"io"
 	"net/http"
@@ -213,8 +214,8 @@ func isResponsesEventStreamContentType(contentType string) bool {
 // "event:" or "data:" prefix, after an optional BOM and/or whitespace) when
 // the upstream omits the Content-Type header. It peeks the body one byte at a
 // time so a short live SSE prefix (e.g. "event: ping\n\n") is recognized before
-// EOF, and it restores every consumed byte via a fresh bufio.Reader so the
-// downstream stream handlers receive the full original body. JSON-like bodies
+// EOF. Every consumed byte is replayed through an io.MultiReader chain so the
+// downstream handlers receive the full original body. JSON-like bodies
 // (leading '{', '[', '"') are rejected early. The (possibly repopulated) body
 // is written back through out; the caller must use out for subsequent reads.
 func isResponsesEventStreamSSEBody(rc io.ReadCloser, out *io.ReadCloser) bool {
@@ -223,6 +224,7 @@ func isResponsesEventStreamSSEBody(rc io.ReadCloser, out *io.ReadCloser) bool {
 	}
 	br := bufio.NewReader(rc)
 	buf := make([]byte, 0, 64)
+	isSSE := false
 	for len(buf) < cap(buf) {
 		b, err := br.ReadByte()
 		if err != nil {
@@ -232,25 +234,24 @@ func isResponsesEventStreamSSEBody(rc io.ReadCloser, out *io.ReadCloser) bool {
 		trimmed := strings.TrimPrefix(string(buf), "\xef\xbb\xbf")
 		trimmed = strings.TrimLeft(trimmed, " 	\r\n")
 		if strings.HasPrefix(trimmed, "event:") || strings.HasPrefix(trimmed, "data:") {
-			*out = &peekReadCloser{Reader: br, closer: rc}
-			return true
+			isSSE = true
+			break
 		}
 		// JSON-like start → definitely not SSE, stop probing.
 		if len(buf) >= 1 && (buf[0] == '{' || buf[0] == '[' || buf[0] == '"') {
 			break
 		}
 	}
-	// Not SSE (or inconclusive): hand the still-buffered body back so the
-	// non-stream JSON handler reads the complete original response.
-	*out = &peekReadCloser{Reader: br, closer: rc}
-	return false
+	// Hand the body back with the sniffed prefix prepended so the downstream
+	// handler reads the complete original response on both paths.
+	*out = &peekReadCloser{Reader: io.MultiReader(bytes.NewReader(buf), br), closer: rc}
+	return isSSE
 }
 
-// peekReadCloser wraps a bufio.Reader plus the original closer so downstream
-// consumers read from the buffer (which still holds every byte) and close
-// correctly.
+// peekReadCloser wraps the replayed body reader plus the original closer so
+// downstream consumers read every byte and close correctly.
 type peekReadCloser struct {
-	Reader *bufio.Reader
+	Reader io.Reader
 	closer io.ReadCloser
 }
 
