@@ -7,6 +7,7 @@ import (
 	"io"
 	"net/http"
 	"regexp"
+	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -62,7 +63,11 @@ func SetupApiRequestHeader(info *common.RelayInfo, c *gin.Context, req *http.Hea
 	}
 }
 
-const clientHeaderPlaceholderPrefix = "{client_header:"
+const (
+	clientHeaderPlaceholderPrefix      = "{client_header:"
+	clientHeaderRegexPlaceholderPrefix = "{client_header_regex:"
+	modelPlaceholder                   = "{model}"
+)
 
 const (
 	headerPassthroughAllKey        = "*"
@@ -99,7 +104,8 @@ var passthroughSkipHeaderNamesLower = map[string]struct{}{
 	"sec-websocket-extensions": {},
 }
 
-var headerPassthroughRegexCache sync.Map // map[string]*regexp.Regexp
+var headerPassthroughRegexCache sync.Map    // map[string]*regexp.Regexp
+var headerOverrideSourceRegexCache sync.Map // map[string]*regexp.Regexp
 
 func getHeaderPassthroughRegex(pattern string) (*regexp.Regexp, error) {
 	pattern = strings.TrimSpace(pattern)
@@ -117,6 +123,29 @@ func getHeaderPassthroughRegex(pattern string) (*regexp.Regexp, error) {
 		return nil, err
 	}
 	actual, _ := headerPassthroughRegexCache.LoadOrStore(pattern, compiled)
+	if re, ok := actual.(*regexp.Regexp); ok {
+		return re, nil
+	}
+	return compiled, nil
+}
+
+func getHeaderOverrideSourceRegex(pattern string) (*regexp.Regexp, error) {
+	pattern = strings.TrimSpace(pattern)
+	if pattern == "" {
+		return nil, errors.New("empty header source regex pattern")
+	}
+	cacheKey := "(?i)" + pattern
+	if v, ok := headerOverrideSourceRegexCache.Load(cacheKey); ok {
+		if re, ok := v.(*regexp.Regexp); ok {
+			return re, nil
+		}
+		headerOverrideSourceRegexCache.Delete(cacheKey)
+	}
+	compiled, err := regexp.Compile(cacheKey)
+	if err != nil {
+		return nil, err
+	}
+	actual, _ := headerOverrideSourceRegexCache.LoadOrStore(cacheKey, compiled)
 	if re, ok := actual.(*regexp.Regexp); ok {
 		return re, nil
 	}
@@ -150,43 +179,183 @@ func shouldSkipPassthroughHeader(name string) bool {
 	return false
 }
 
-func applyHeaderOverridePlaceholders(template string, c *gin.Context, apiKey string) (string, bool, error) {
+func applyHeaderOverridePlaceholders(template string, c *gin.Context, info *common.RelayInfo) (string, bool, error) {
 	trimmed := strings.TrimSpace(template)
-	if strings.HasPrefix(trimmed, clientHeaderPlaceholderPrefix) {
-		afterPrefix := trimmed[len(clientHeaderPlaceholderPrefix):]
-		end := strings.Index(afterPrefix, "}")
-		if end < 0 || end != len(afterPrefix)-1 {
+	if strings.HasPrefix(trimmed, clientHeaderRegexPlaceholderPrefix) || strings.HasPrefix(trimmed, clientHeaderPlaceholderPrefix) {
+		prefix := clientHeaderPlaceholderPrefix
+		if strings.HasPrefix(trimmed, clientHeaderRegexPlaceholderPrefix) {
+			prefix = clientHeaderRegexPlaceholderPrefix
+		}
+		content, ok := parseHeaderOverridePlaceholderContent(trimmed, prefix)
+		if !ok {
 			return "", false, fmt.Errorf("client_header placeholder must be the full value: %q", template)
 		}
+		source, fallback, hasFallback, err := parseHeaderOverrideSource(content)
+		if err != nil {
+			return "", false, err
+		}
 
-		name := strings.TrimSpace(afterPrefix[:end])
-		if name == "" {
-			return "", false, fmt.Errorf("client_header placeholder name is empty: %q", template)
+		var value string
+		var found bool
+		if prefix == clientHeaderRegexPlaceholderPrefix {
+			value, found, err = firstMatchingRequestHeader(c, source)
+		} else {
+			value, found, err = resolveClientHeaderSource(c, source)
 		}
-		if c == nil || c.Request == nil {
-			return "", false, fmt.Errorf("missing request context for client_header placeholder")
+		if err != nil {
+			return "", false, err
 		}
-		clientHeaderValue := c.Request.Header.Get(name)
-		if strings.TrimSpace(clientHeaderValue) == "" {
+		if found {
+			// Keep client-provided values untouched; never interpolate
+			// {api_key} or {model} inside client-supplied content.
+			return value, true, nil
+		}
+		if !hasFallback {
 			return "", false, nil
 		}
-		// Do not interpolate {api_key} inside client-supplied content.
-		return clientHeaderValue, true, nil
+
+		resolvedFallback := interpolateHeaderOverridePlaceholders(fallback, resolveHeaderOverrideAPIKey(info), resolveHeaderOverrideModel(c, info))
+		if strings.TrimSpace(resolvedFallback) == "" {
+			return "", false, nil
+		}
+		return resolvedFallback, true, nil
 	}
 
-	if strings.Contains(template, "{api_key}") {
-		template = strings.ReplaceAll(template, "{api_key}", apiKey)
-	}
+	template = interpolateHeaderOverridePlaceholders(template, resolveHeaderOverrideAPIKey(info), resolveHeaderOverrideModel(c, info))
 	if strings.TrimSpace(template) == "" {
 		return "", false, nil
 	}
 	return template, true, nil
 }
 
+func parseHeaderOverridePlaceholderContent(template, prefix string) (string, bool) {
+	if !strings.HasPrefix(template, prefix) {
+		return "", false
+	}
+	depth := 1
+	for idx := len(prefix); idx < len(template); idx++ {
+		switch template[idx] {
+		case '{':
+			depth++
+		case '}':
+			depth--
+			if depth == 0 {
+				if idx != len(template)-1 {
+					return "", false
+				}
+				return template[len(prefix):idx], true
+			}
+		}
+	}
+	return "", false
+}
+
+func parseHeaderOverrideSource(content string) (source, fallback string, hasFallback bool, err error) {
+	if separatorIndex := strings.Index(content, "||"); separatorIndex >= 0 {
+		source = strings.TrimSpace(content[:separatorIndex])
+		fallback = content[separatorIndex+2:] // Keep original spacing/placeholders in fallback.
+		hasFallback = true
+	} else {
+		source = strings.TrimSpace(content)
+	}
+	if strings.TrimSpace(source) == "" {
+		return "", "", false, fmt.Errorf("client_header placeholder source is empty")
+	}
+	return source, fallback, hasFallback, nil
+}
+
+func resolveClientHeaderSource(c *gin.Context, source string) (string, bool, error) {
+	source = strings.TrimSpace(source)
+	if source == "" {
+		return "", false, fmt.Errorf("client_header placeholder source is empty")
+	}
+	if c == nil || c.Request == nil {
+		return "", false, fmt.Errorf("missing request context for client_header placeholder")
+	}
+
+	lower := strings.ToLower(source)
+	if strings.HasPrefix(lower, headerPassthroughRegexPrefix) || strings.HasPrefix(lower, headerPassthroughRegexPrefixV2) {
+		pattern := strings.TrimSpace(source)
+		if strings.HasPrefix(lower, headerPassthroughRegexPrefix) {
+			pattern = strings.TrimSpace(source[len(headerPassthroughRegexPrefix):])
+		} else {
+			pattern = strings.TrimSpace(source[len(headerPassthroughRegexPrefixV2):])
+		}
+		if pattern == "" {
+			return "", false, fmt.Errorf("client_header regex source pattern is empty")
+		}
+		return firstMatchingRequestHeader(c, pattern)
+	}
+
+	value := strings.TrimSpace(c.Request.Header.Get(source))
+	if value == "" {
+		return "", false, nil
+	}
+	return value, true, nil
+}
+
+func firstMatchingRequestHeader(c *gin.Context, pattern string) (string, bool, error) {
+	re, err := getHeaderOverrideSourceRegex(pattern)
+	if err != nil {
+		return "", false, err
+	}
+	names := make([]string, 0, len(c.Request.Header))
+	for name := range c.Request.Header {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+	for _, name := range names {
+		if !re.MatchString(name) {
+			continue
+		}
+		value := strings.TrimSpace(c.Request.Header.Get(name))
+		if value != "" {
+			return value, true, nil
+		}
+	}
+	return "", false, nil
+}
+
+func interpolateHeaderOverridePlaceholders(value, apiKey, model string) string {
+	value = strings.ReplaceAll(value, "{api_key}", apiKey)
+	value = strings.ReplaceAll(value, modelPlaceholder, model)
+	return value
+}
+
+func resolveHeaderOverrideAPIKey(info *common.RelayInfo) string {
+	if info == nil || info.ChannelMeta == nil {
+		return ""
+	}
+	return info.ApiKey
+}
+
+func resolveHeaderOverrideModel(c *gin.Context, info *common.RelayInfo) string {
+	if info != nil {
+		if info.ChannelMeta != nil {
+			if info.UpstreamModelName != "" {
+				return info.UpstreamModelName
+			}
+		}
+		if info.OriginModelName != "" {
+			return info.OriginModelName
+		}
+	}
+	if c != nil {
+		if model := strings.TrimSpace(c.GetString("original_model")); model != "" {
+			return model
+		}
+	}
+	return ""
+}
+
 // processHeaderOverride applies channel header overrides, with placeholder substitution.
 // Supported placeholders:
 //   - {api_key}: resolved to the channel API key
 //   - {client_header:<name>}: resolved to the incoming request header value
+//   - {client_header:<name>||fallback}: same as above, with a fallback value
+//   - {client_header_regex:<pattern>||fallback}: resolved to the first matching
+//     incoming request header value; otherwise the fallback value is used
+//   - {model}: resolved to the model name for this request
 //
 // Header passthrough rules (keys only; values are ignored):
 //   - "*": passthrough all incoming headers by name (excluding unsafe headers)
@@ -280,7 +449,7 @@ func processHeaderOverride(info *common.RelayInfo, c *gin.Context) (map[string]s
 			continue
 		}
 
-		value, include, err := applyHeaderOverridePlaceholders(str, c, info.ApiKey)
+		value, include, err := applyHeaderOverridePlaceholders(str, c, info)
 		if err != nil {
 			return nil, types.NewError(err, types.ErrorCodeChannelHeaderOverrideInvalid)
 		}
